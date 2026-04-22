@@ -1506,8 +1506,16 @@ class LLM:
                            CPU memory pressure.
             mode: How to handle any existing requests, can be "abort", "wait",
                 or "keep".
+
+        RFC #34303: the default `cumem` backend preserves today's behavior.
+        Alternative backends (`cuda-checkpoint`, `cuda-checkpoint+criu`,
+        `thaw`) dispatch through `vllm.sleep_mode_backends` — select with
+        `--sleep-mode <name>` / `ModelConfig.sleep_mode_backend`.
         """
-        self.llm_engine.sleep(level=level, mode=mode)
+        from vllm.sleep_mode_backends import get_backend
+
+        backend_name = self.llm_engine.vllm_config.model_config.sleep_mode_backend
+        get_backend(backend_name).sleep(self.llm_engine, level=level, mode=mode)
 
     def wake_up(self, tags: list[str] | None = None):
         """
@@ -1522,7 +1530,10 @@ class LLM:
                 (or None) before the engine is used again.
                 Use tags=["scheduling"] to resume from level 0 sleep.
         """
-        self.llm_engine.wake_up(tags)
+        from vllm.sleep_mode_backends import get_backend
+
+        backend_name = self.llm_engine.vllm_config.model_config.sleep_mode_backend
+        get_backend(backend_name).wake_up(self.llm_engine, tags)
 
     def get_metrics(self) -> list["Metric"]:
         """Return a snapshot of aggregated metrics from Prometheus.

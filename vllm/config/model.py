@@ -91,6 +91,16 @@ LogprobsMode = Literal[
 HfOverrides = dict[str, Any] | Callable[[PretrainedConfig], PretrainedConfig]
 ModelImpl = Literal["auto", "vllm", "transformers", "terratorch"]
 LayerBlockType = Literal["attention", "linear_attention", "mamba"]
+# RFC #34303: sleep-mode backend selector. "cumem" is today's built-in path
+# (CuMemAllocator tagged release). The cuda-checkpoint / cuda-checkpoint+criu
+# tiers are proposed in the RFC. "thaw" dispatches to the thaw-ai/thaw
+# snapshot+restore backend (serialized weights + KV + scheduler state).
+SleepModeBackend = Literal[
+    "cumem",
+    "cuda-checkpoint",
+    "cuda-checkpoint+criu",
+    "thaw",
+]
 
 _RUNNER_CONVERTS: dict[RunnerType, list[ConvertType]] = {
     "generate": [],
@@ -284,6 +294,28 @@ class ModelConfig:
     enable_sleep_mode: bool = False
     """Enable sleep mode for the engine (only cuda and
     hip platforms are supported)."""
+    sleep_mode_backend: SleepModeBackend = "cumem"
+    """Which sleep-mode backend to use when `enable_sleep_mode=True`.
+
+    - `cumem` (default): release tagged allocations through `CuMemAllocator`.
+      The current built-in path.
+    - `cuda-checkpoint` (RFC #34303): CUDA context checkpoint via
+      `cuCheckpointProcess*` for fast resume of compiled kernels.
+    - `cuda-checkpoint+criu` (RFC #34303): combine with CRIU for full-process
+      capture; restores kernel cache + NCCL state.
+    - `thaw` (RFC #34303): dispatch to `thaw_vllm.sleep_mode` — serializes
+      weights + KV cache + prefix-hash + scheduler state to disk/S3. Requires
+      `pip install thaw-vllm thaw-native`; discovered via
+      `vllm.general_plugins` entrypoints. Bit-identical greedy output
+      demonstrated on Llama-3.1-8B TP=1 and Llama-3.1-70B TP=2 (see
+      https://github.com/thaw-ai/thaw/tree/main/site/receipts/2026-04-22_rfc).
+      Does not preserve CUDA graphs or NCCL — complementary to
+      `cuda-checkpoint`, not competitive.
+    """
+    sleep_mode_path: str | None = None
+    """When `sleep_mode_backend` is `thaw`, the snapshot path/URI the engine
+    should serialize to on `sleep()` and restore from on `wake_up()`. Accepts
+    local paths and `s3://` URIs. Ignored for other backends."""
     model_impl: str | ModelImpl = "auto"
     """Which implementation of the model to use:
 
