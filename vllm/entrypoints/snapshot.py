@@ -1278,6 +1278,9 @@ def create_snapshot(force: bool = False, dry_run: bool = False) -> None:
             replace = True  # stale exact-key manifest: re-prime without --force
         _prepare_directory(directory, replace)
         _run_create(key, directory, create_env, key_obj)
+        # a fresh prime heals any pending miss: clear the wrapper's marker
+        with contextlib.suppress(OSError):
+            (root / f".restore-miss.{key}").unlink(missing_ok=True)
     finally:
         lock.release()
     logger.info("snapshot created key=%s dir=%s", key, directory)
@@ -1296,6 +1299,19 @@ def _first_diff(a: dict[str, Any], b: dict[str, Any]) -> str | None:
         elif av != bv:
             return field
     return None
+
+
+def _record_restore_miss(root: Path, key: str, reason: str) -> None:
+    # Repairable miss: mark <root>/.restore-miss.<key> so the wrapper's next
+    # boot re-runs create (create clears it on rc=0/rc=3). Best-effort:
+    # marker IO must never affect the boot, every failure is swallowed.
+    with contextlib.suppress(Exception):
+        marker = root / f".restore-miss.{key}"
+        # tmp name must NOT match the wrapper's .restore-miss.* glob, or a
+        # crashed write becomes a permanent create tax
+        temporary = marker.with_name(f".miss-tmp.{key}")
+        temporary.write_text(reason + "\n")
+        os.replace(temporary, marker)
 
 
 def _diagnose_miss(
@@ -1539,6 +1555,7 @@ def _run_criu_restore(
             kill_restored_group(restored_pid, process.pid)
             _wait_bounded(process)
             logger.info("snapshot restore miss (%s)", reason)
+            _record_restore_miss(directory.parent, directory.name, reason)
             return
         committed = True
         lock.release()  # restore critical section ends at commit ack
@@ -1589,6 +1606,7 @@ def _run_criu_restore(
                     # one INFO line: fold a sanitized criu-log tail into it
                     reason = f"{reason}; criu log: {' | '.join(tail.splitlines())}"
                 logger.info("snapshot restore miss (%s)", reason)
+                _record_restore_miss(directory.parent, directory.name, reason)
                 return
         raise
     finally:
@@ -1619,10 +1637,9 @@ def _restore_serve() -> None:
     root = _snapshot_root()
     directory = root / key
     if not (directory / "MANIFEST.json").is_file():
-        logger.info(
-            "snapshot restore miss (%s)",
-            _diagnose_miss(root, key_obj, key, live_env),
-        )
+        reason = _diagnose_miss(root, key_obj, key, live_env)
+        logger.info("snapshot restore miss (%s)", reason)
+        _record_restore_miss(root, key, reason)
         return
     lock = _acquire_lock(root, key)
     try:
@@ -1630,8 +1647,14 @@ def _restore_serve() -> None:
         miss = _validate_layer2(manifest, directory, live_env)
         if miss:
             logger.info("snapshot restore miss (%s)", miss)
+            _record_restore_miss(root, key, miss)
             return
         _run_criu_restore(directory, manifest, live_env, lock)
+    except Exception as error:
+        # keyed failure: mark it here (root/key in scope), the caller's
+        # cold-fallback catch stays log-only
+        _record_restore_miss(root, key, str(error))
+        raise
     finally:
         lock.release()
 
@@ -1657,6 +1680,12 @@ def maybe_restore_serve() -> None:
             with contextlib.suppress(Exception):  # any doubt -> slow path decides
                 directory = _existing_snapshot_valid()
             if directory is not None:
+                # transient miss + still-valid manifest: clear the marker so
+                # the wrapper's skip path returns (never a permanent tax)
+                with contextlib.suppress(OSError):
+                    (
+                        directory.parent / f".restore-miss.{directory.name}"
+                    ).unlink(missing_ok=True)
                 logger.info(
                     "snapshot already exists (pass --force to replace) key=%s dir=%s",
                     directory.name,

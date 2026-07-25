@@ -181,6 +181,10 @@ def test_restore_hook_cold_fallback_logs_miss(monkeypatch, caplog, tmp_path):
     ]
     assert len(misses) == 1
     assert "no snapshot" in misses[0].getMessage()
+    # the repairable miss leaves a root-level marker naming the key, with a
+    # reason line, so the wrapper's next boot re-runs create
+    marker = tmp_path / f".restore-miss.{key_from({'stub': 1})}"
+    assert "no snapshot" in marker.read_text()
 
 
 def test_restore_hook_refuses_pythonhashseed(monkeypatch, caplog):
@@ -283,9 +287,17 @@ def test_snapshot_create_early_exit_when_snapshot_current(monkeypatch, tmp_path)
     monkeypatch.setenv("VLLM_SNAPSHOT_ROOT", str(tmp_path))
     monkeypatch.setattr(snapshot_module, "lookup_key", lambda env: {"stub": 1})
     _prime_snapshot_dir(tmp_path, key_from({"stub": 1}))
+    # a valid manifest heals a transient miss: rc=3 clears the current key's
+    # marker (else it becomes a permanent create tax) and ONLY that key's
+    current = tmp_path / f".restore-miss.{key_from({'stub': 1})}"
+    other = tmp_path / ".restore-miss.otherkey"
+    current.write_text("transient\n")
+    other.write_text("transient\n")
     with pytest.raises(SystemExit) as excinfo:
         maybe_restore_serve()
     assert excinfo.value.code == 3
+    assert not current.exists()
+    assert other.exists()
 
 
 def test_snapshot_create_falls_through_on_stale_manifest(monkeypatch, tmp_path):
@@ -319,6 +331,68 @@ def test_snapshot_create_flags_skip_early_exit(monkeypatch, tmp_path):
     monkeypatch.setattr(snapshot_module, "lookup_key", lambda env: {"stub": 1})
     _prime_snapshot_dir(tmp_path, key_from({"stub": 1}))
     assert maybe_restore_serve() is None
+
+
+def test_snapshot_create_prime_clears_miss_marker(monkeypatch, tmp_path):
+    # A real prime (rc=0) clears the wrapper's miss marker; --dry-run also
+    # exits zero but primes nothing, so it must leave the marker alone.
+    import vllm.entrypoints.snapshot as snapshot_module
+
+    monkeypatch.setattr(snapshot_module, "_entry_state", {})
+    monkeypatch.setenv("VLLM_SNAPSHOT_ROOT", str(tmp_path))
+    monkeypatch.setattr(snapshot_module, "require_dump_host", lambda: None)
+    monkeypatch.setattr(snapshot_module, "lookup_key", lambda env: {"stub": 1})
+    monkeypatch.setattr(snapshot_module, "_run_create", lambda *args: None)
+    marker = tmp_path / f".restore-miss.{key_from({'stub': 1})}"
+    marker.write_text("transient\n")
+    snapshot_module.create_snapshot(dry_run=True)
+    assert marker.exists()
+    snapshot_module.create_snapshot()
+    assert not marker.exists()
+
+
+def test_restore_hook_marker_write_failure_is_swallowed(monkeypatch, caplog, tmp_path):
+    # Marker IO must never affect the boot: with the atomic writer raising,
+    # the miss still cold-falls-back exactly as without the marker.
+    import vllm.entrypoints.snapshot as snapshot_module
+
+    monkeypatch.setattr(snapshot_module, "_entry_state", {})
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys, "argv", ["vllm", "serve", "some-model"])
+    monkeypatch.setenv("VLLM_SNAPSHOT", "1")
+    monkeypatch.delenv("VLLM_SNAPSHOT_RESTORED", raising=False)
+    monkeypatch.delenv("PYTHONHASHSEED", raising=False)
+    monkeypatch.setenv("VLLM_SNAPSHOT_ROOT", str(tmp_path))
+    monkeypatch.setattr(snapshot_module, "lookup_key", lambda env: {"stub": 1})
+
+    def raise_oserror(*args, **kwargs):
+        raise OSError("read-only root")
+
+    monkeypatch.setattr(snapshot_module.Path, "write_text", raise_oserror)
+    with caplog.at_level("INFO", logger="vllm.entrypoints.snapshot"):
+        assert maybe_restore_serve() is None
+    assert not list(tmp_path.iterdir())
+    misses = [
+        record
+        for record in caplog.records
+        if "snapshot restore miss" in record.getMessage()
+    ]
+    assert len(misses) == 1
+    # replace-failure variant: the write lands but os.replace dies; whatever
+    # residue remains must not match the wrapper's .restore-miss.* glob (a
+    # matching leftover would be a permanent create tax)
+    monkeypatch.undo()
+    monkeypatch.setattr(snapshot_module, "_entry_state", {})
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys, "argv", ["vllm", "serve", "some-model"])
+    monkeypatch.setenv("VLLM_SNAPSHOT", "1")
+    monkeypatch.delenv("VLLM_SNAPSHOT_RESTORED", raising=False)
+    monkeypatch.delenv("PYTHONHASHSEED", raising=False)
+    monkeypatch.setenv("VLLM_SNAPSHOT_ROOT", str(tmp_path))
+    monkeypatch.setattr(snapshot_module, "lookup_key", lambda env: {"stub": 1})
+    monkeypatch.setattr(snapshot_module.os, "replace", raise_oserror)
+    assert maybe_restore_serve() is None
+    assert not list(tmp_path.glob(".restore-miss.*"))
 
 
 def test_lookup_key_keys_dpkg_dists_by_deb_revision(monkeypatch):

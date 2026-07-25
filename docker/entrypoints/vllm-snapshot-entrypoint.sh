@@ -22,6 +22,36 @@ if [ -z "$caps" ] || [ "$((16#$caps >> 40 & 1))" -ne 1 ] || [ "$((16#$caps >> 21
 fi
 
 export VLLM_SNAPSHOT=1
+
+# Create-skip: a snapshot on the volume with no pending .restore-miss.*
+# marker means create would only rediscover rc=3, so skip its import bill
+# entirely. A restore miss writes a marker (snapshot.py) and the next boot
+# runs create again; rc=0/rc=3 clears it. Root mirrors envs.py:693 exactly,
+# including its empty-vs-unset split and os.path.join's empty-prefix
+# behavior (join("", x) is relative x, no leading slash): SNAPSHOT_ROOT uses
+# python `or` (empty falls back); CACHE_ROOT/XDG use get-with-default
+# (set-but-empty honored verbatim). Leading ~/ expands like expanduser();
+# bare ~user/ is left untouched.
+if [ -n "${VLLM_SNAPSHOT_ROOT:-}" ]; then
+    root="$VLLM_SNAPSHOT_ROOT"
+else
+    if [ "${VLLM_CACHE_ROOT+x}" ]; then
+        cache_root="$VLLM_CACHE_ROOT"
+    else
+        if [ "${XDG_CACHE_HOME+x}" ]; then xdg="$XDG_CACHE_HOME"; else xdg="$HOME/.cache"; fi
+        cache_root="${xdg:+$xdg/}vllm"
+    fi
+    root="${cache_root:+$cache_root/}snapshots"
+fi
+root="${root/#\~\//$HOME/}"
+shopt -s nullglob
+manifests=("$root"/*/MANIFEST.json)
+miss_markers=("$root"/.restore-miss.*)
+shopt -u nullglob
+if ((${#manifests[@]})) && ((${#miss_markers[@]} == 0)); then
+    serve "$@"   # snapshot present, no pending miss: skip create entirely
+fi
+
 vllm snapshot create
 status=$?
 case "$status" in
