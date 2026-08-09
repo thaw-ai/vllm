@@ -38,6 +38,7 @@ class ControlArgs:
     release_file: Path
     release_timeout_s: float
     prompt: str
+    minimize_snapshot_state: bool
 
 
 def validate_oracle(oracle: Oracle) -> None:
@@ -102,6 +103,7 @@ def parse_control_args(argv: list[str]) -> tuple[ControlArgs, list[str]]:
     parser.add_argument("--release-file", type=Path, required=True)
     parser.add_argument("--release-timeout-s", type=float, default=900.0)
     parser.add_argument("--canary-prompt", default="The capital of France is")
+    parser.add_argument("--minimize-snapshot-state", action="store_true")
     control_args, remaining = parser.parse_known_args(argv)
     if remaining and remaining[0] == "--":
         remaining = remaining[1:]
@@ -115,9 +117,22 @@ def parse_control_args(argv: list[str]) -> tuple[ControlArgs, list[str]]:
             release_file=control_args.release_file,
             release_timeout_s=control_args.release_timeout_s,
             prompt=control_args.canary_prompt,
+            minimize_snapshot_state=control_args.minimize_snapshot_state,
         ),
         remaining,
     )
+
+
+async def _release_reloadable_state(engine: Any) -> None:
+    """Discard model and KV state before the process image is captured."""
+    await engine.sleep(level=2)
+
+
+async def _restore_reloadable_state(engine: Any) -> None:
+    """Rebuild state discarded by ``_release_reloadable_state``."""
+    await engine.wake_up(tags=["weights"])
+    await engine.collective_rpc("reload_weights")
+    await engine.wake_up(tags=["kv_cache"])
 
 
 def oracle_from_request_output(request_output: Any) -> Oracle:
@@ -205,6 +220,9 @@ async def run_vllm_snapshot_child(control: ControlArgs, args: Any) -> None:
         setup_server,
     )
 
+    if control.minimize_snapshot_state:
+        args.enable_sleep_mode = True
+
     async def run_canary(engine: Any) -> Oracle:
         return await run_engine_canary(engine, control.prompt)
 
@@ -236,6 +254,12 @@ async def run_vllm_snapshot_child(control: ControlArgs, args: Any) -> None:
         write_ready=lambda oracle: write_ready_atomic(control.ready_file, oracle),
         wait_for_release=wait_for_release,
         bind_and_serve=bind_and_serve,
+        release_reloadable_state=(
+            _release_reloadable_state if control.minimize_snapshot_state else None
+        ),
+        restore_reloadable_state=(
+            _restore_reloadable_state if control.minimize_snapshot_state else None
+        ),
     )
 
 
@@ -255,14 +279,20 @@ async def run_snapshot_child(
     write_ready: Callable[[Oracle], None],
     wait_for_release: Callable[[], Awaitable[None]],
     bind_and_serve: Callable[[EngineT], Awaitable[None]],
+    release_reloadable_state: Callable[[EngineT], Awaitable[None]] | None = None,
+    restore_reloadable_state: Callable[[EngineT], Awaitable[None]] | None = None,
 ) -> None:
     """Initialize and validate an engine before creating its HTTP listener."""
     async with engine_context as engine:
         oracle = await run_canary(engine)
         validate_oracle(oracle)
+        if release_reloadable_state is not None:
+            await release_reloadable_state(engine)
         prepare_snapshot()
         write_ready(oracle)
         await wait_for_release()
+        if restore_reloadable_state is not None:
+            await restore_reloadable_state(engine)
         await bind_and_serve(engine)
 
 

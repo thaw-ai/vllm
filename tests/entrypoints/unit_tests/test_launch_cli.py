@@ -238,6 +238,18 @@ def test_snapshot_create_parses_model_and_directory():
     assert args.snapshot_dir == "/tmp/qwen-snapshot"
 
 
+def test_snapshot_create_parses_minimized_state_mode():
+    args = parse_snapshot(
+        "create",
+        "Qwen/Qwen3-0.6B",
+        "--snapshot-dir",
+        "/tmp/qwen-snapshot",
+        "--minimize-snapshot-state",
+    )
+
+    assert args.minimize_snapshot_state
+
+
 def test_snapshot_inspect_parses_directory():
     args = parse_snapshot("inspect", "/tmp/qwen-snapshot")
 

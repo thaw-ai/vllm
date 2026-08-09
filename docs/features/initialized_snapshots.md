@@ -32,7 +32,9 @@ Snapshots currently require all of the following:
 - An installed vLLM build or a clean editable Git checkout. Snapshot creation
   and restore reject tracked or untracked source changes because a commit SHA
   alone cannot identify their contents.
-- Enough local disk for the complete process and CUDA snapshot.
+- Enough local disk for the captured process and CUDA state. The default mode
+  captures the initialized model state; `--minimize-snapshot-state` trades a
+  smaller artifact for reloading model files during restore.
 
 Set `CRIU_CUDA_PLUGIN_DIR` to the directory containing `cuda_plugin.so`:
 
@@ -62,6 +64,38 @@ software and hardware compatibility identity, and the canary output. This is a
 strict compatibility check over the recorded fields, not a cryptographic proof
 of every installed binary. Treat the artifact as sensitive data. vLLM creates
 the snapshot directory with mode `0700` and its manifest with mode `0600`.
+
+### Minimize the captured state
+
+Use `--minimize-snapshot-state` when model files will remain available on the
+same host and a smaller artifact is more important than making restore
+independent of those files:
+
+```bash
+VLLM_NO_USAGE_STATS=1 vllm snapshot create Qwen/Qwen3-0.6B \
+  --snapshot-dir /var/lib/vllm/snapshots/qwen3-0.6b-minimized \
+  --revision c1899de289a04d12100db370d81485cdf75e47ca \
+  --dtype float16 \
+  --max-model-len 512 \
+  --minimize-snapshot-state
+```
+
+This mode releases model-weight and KV-cache allocations after the correctness
+canary and before capture. After restore, vLLM reloads the weights from the
+recorded model files and recreates the KV cache before binding the HTTP server.
+Sleep mode is enabled automatically for the snapshot child.
+
+The tradeoff depends on storage state. Warm model-file pages can make the
+smaller artifact both cheaper to store and faster to activate, while cold or
+slow storage can make weight reload slower than restoring the complete process
+image. Measure both modes with the page-cache state that represents the target
+deployment.
+
+This mode has been validated on dense float16 TP1 models. Other model formats
+depend on their existing sleep level 2 weight-reload support and have not been
+validated by this snapshot path. The restore command checks the first generated
+token against the snapshot canary and tears down the restored process tree if
+the result differs.
 
 ## Inspect a snapshot
 

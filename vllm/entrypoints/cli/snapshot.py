@@ -95,6 +95,15 @@ class SnapshotSubcommand(CLISubcommand):
         )
         create_parser = make_arg_parser(create_parser)
         create_parser.add_argument("--snapshot-dir", required=True)
+        create_parser.add_argument(
+            "--minimize-snapshot-state",
+            action="store_true",
+            help=(
+                "Discard reloadable model and KV state before capture, then "
+                "rebuild it before HTTP bind after restore. This reduces artifact "
+                "size when model files remain available on the same host."
+            ),
+        )
         create_parser.set_defaults(snapshot_dispatch=run_create)
 
         inspect_parser = actions.add_parser(

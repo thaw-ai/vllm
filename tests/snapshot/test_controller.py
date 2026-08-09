@@ -93,6 +93,47 @@ async def test_snapshot_child_waits_before_http_bind():
 
 
 @pytest.mark.asyncio
+async def test_minimized_snapshot_rebuilds_state_before_http_bind():
+    events: list[str] = []
+    engine = object()
+
+    @asynccontextmanager
+    async def engine_context():
+        yield engine
+
+    async def release_state(actual_engine: object) -> None:
+        assert actual_engine is engine
+        events.append("release-state")
+
+    async def restore_state(actual_engine: object) -> None:
+        assert actual_engine is engine
+        events.append("restore-state")
+
+    async def bind_and_serve(actual_engine: object) -> None:
+        assert actual_engine is engine
+        events.append("http-bound")
+
+    await run_snapshot_child(
+        engine_context=engine_context(),
+        run_canary=lambda _engine: _return_oracle(),
+        prepare_snapshot=lambda: events.append("streams-detached"),
+        write_ready=lambda _oracle: events.append("ready-written"),
+        wait_for_release=_return_none,
+        bind_and_serve=bind_and_serve,
+        release_reloadable_state=release_state,
+        restore_reloadable_state=restore_state,
+    )
+
+    assert events == [
+        "release-state",
+        "streams-detached",
+        "ready-written",
+        "restore-state",
+        "http-bound",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_empty_canary_prevents_http_bind():
     bound = False
 
@@ -248,6 +289,7 @@ def test_child_control_flags_are_removed_from_vllm_args():
             "release.json",
             "--release-timeout-s",
             "123",
+            "--minimize-snapshot-state",
             "--",
             "Qwen/Qwen3-0.6B",
             "--dtype",
@@ -258,7 +300,49 @@ def test_child_control_flags_are_removed_from_vllm_args():
     assert control.ready_file == Path("ready.json")
     assert control.release_file == Path("release.json")
     assert control.release_timeout_s == 123
+    assert control.minimize_snapshot_state
     assert remaining == ["Qwen/Qwen3-0.6B", "--dtype", "float16"]
+
+
+def test_snapshot_create_options_are_removed_from_engine_argv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    target = tmp_path / "snapshot"
+    tools = FakeSnapshotTools()
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "vllm",
+            "snapshot",
+            "create",
+            "Qwen/Qwen3-0.6B",
+            "--snapshot-dir",
+            str(target),
+            "--minimize-snapshot-state",
+            "--dtype",
+            "float16",
+        ],
+    )
+
+    create_snapshot(
+        argparse.Namespace(
+            snapshot_dir=str(target),
+            model_tag="Qwen/Qwen3-0.6B",
+            minimize_snapshot_state=True,
+        ),
+        tools=tools,
+    )
+
+    manifest = read_manifest(target)
+    assert tools.minimize_snapshot_state
+    assert manifest.boundary == "post-engine-init-reloadable-state-released"
+    assert tools.engine_argv == (
+        "Qwen/Qwen3-0.6B",
+        "--dtype",
+        "float16",
+        "--enable-sleep-mode",
+    )
 
 
 class FakeSnapshotTools:
@@ -267,13 +351,23 @@ class FakeSnapshotTools:
         self.fail_at: str | None = None
         self.identity_change: dict[str, object] = {}
         self.launch_workdir: Path | None = None
+        self.minimize_snapshot_state = False
+        self.engine_argv: tuple[str, ...] = ()
 
     def preflight(self, _action: str, _artifact: Path) -> None:
         self.events.append("preflight")
 
-    def launch_child(self, workdir: Path, _engine_argv: tuple[str, ...]):
+    def launch_child(
+        self,
+        workdir: Path,
+        engine_argv: tuple[str, ...],
+        *,
+        minimize_snapshot_state: bool,
+    ):
         self.events.append("launch-child")
         self.launch_workdir = workdir
+        self.minimize_snapshot_state = minimize_snapshot_state
+        self.engine_argv = engine_argv
         assert not (workdir / "manifest.json").exists()
         (workdir / "child.log").touch()
         return 100
@@ -302,13 +396,18 @@ class FakeSnapshotTools:
 
     def make_manifest(
         self,
-        _args: argparse.Namespace,
+        args: argparse.Namespace,
         _engine_argv: tuple[str, ...],
         inventory: ProcessInventory,
         oracle: Oracle,
         _workdir: Path,
     ) -> SnapshotManifest:
         return _controller_manifest(
+            boundary=(
+                "post-engine-init-reloadable-state-released"
+                if getattr(args, "minimize_snapshot_state", False)
+                else "post-engine-init-pre-http-bind"
+            ),
             process_tree=inventory.process_tree,
             cuda_holders=inventory.cuda_holders,
             oracle_token_ids=oracle.token_ids,

@@ -122,7 +122,13 @@ def _validate_tcp_connections(
 class SnapshotTools(Protocol):
     def preflight(self, action: str, artifact: Path) -> None: ...
 
-    def launch_child(self, workdir: Path, engine_argv: tuple[str, ...]) -> int: ...
+    def launch_child(
+        self,
+        workdir: Path,
+        engine_argv: tuple[str, ...],
+        *,
+        minimize_snapshot_state: bool,
+    ) -> int: ...
 
     def wait_ready(self, workdir: Path, root_pid: int) -> Oracle: ...
 
@@ -166,7 +172,7 @@ def _remove_snapshot_option(argv: tuple[str, ...]) -> tuple[str, ...]:
     for item in iterator:
         if item == "--snapshot-dir":
             next(iterator, None)
-        elif item.startswith("--snapshot-dir="):
+        elif item.startswith("--snapshot-dir=") or item == "--minimize-snapshot-state":
             continue
         else:
             remaining.append(item)
@@ -202,7 +208,14 @@ def create_snapshot(
     inventory: ProcessInventory | None = None
     try:
         child_argv = engine_argv or _current_engine_argv(args)
-        root_pid = toolset.launch_child(target, child_argv)
+        minimize_snapshot_state = bool(getattr(args, "minimize_snapshot_state", False))
+        if minimize_snapshot_state and "--enable-sleep-mode" not in child_argv:
+            child_argv = (*child_argv, "--enable-sleep-mode")
+        root_pid = toolset.launch_child(
+            target,
+            child_argv,
+            minimize_snapshot_state=minimize_snapshot_state,
+        )
         oracle = toolset.wait_ready(target, root_pid)
         inventory = toolset.inventory(root_pid)
         toolset.dump(target, inventory)
@@ -306,7 +319,13 @@ class LocalSnapshotTools:
         else:
             validate_artifact_root(artifact, creating=True)
 
-    def launch_child(self, workdir: Path, engine_argv: tuple[str, ...]) -> int:
+    def launch_child(
+        self,
+        workdir: Path,
+        engine_argv: tuple[str, ...],
+        *,
+        minimize_snapshot_state: bool,
+    ) -> int:
         log_file = (workdir / "child.log").open("wb")
         command = [
             sys.executable,
@@ -318,6 +337,7 @@ class LocalSnapshotTools:
             "release.json",
             "--release-timeout-s",
             str(self.timeout_s),
+            *(["--minimize-snapshot-state"] if minimize_snapshot_state else []),
             "--",
             *engine_argv,
         ]
@@ -754,7 +774,11 @@ class LocalSnapshotTools:
         source_revision = self._source_revision()
         return SnapshotManifest(
             schema_version=1,
-            boundary="post-engine-init-pre-http-bind",
+            boundary=(
+                "post-engine-init-reloadable-state-released"
+                if getattr(args, "minimize_snapshot_state", False)
+                else "post-engine-init-pre-http-bind"
+            ),
             complete=True,
             created_at=datetime.now(timezone.utc).isoformat(),
             artifact_bytes=self._artifact_bytes(workdir),
